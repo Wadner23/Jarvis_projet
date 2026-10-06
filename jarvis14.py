@@ -31,10 +31,10 @@ except Exception:
     pass
 
 import numpy as np
-import openwakeword
 import sounddevice as sd
-from faster_whisper import WhisperModel
-from openwakeword.model import Model as WakeModel
+import openai
+import tempfile
+from pathlib import Path
 
 from core import config, journal, memoire, personnalite, registre, voix
 from core.confirmation_vocale import NON, TOUJOURS, interpreter_confirmation
@@ -790,58 +790,59 @@ def repondre(historique):
 
 # ---------------------------------------------------------------- whisper
 
+class WhisperSegment:
+    def __init__(self, text):
+        self.text = text
+
+class OpenAIWhisper:
+    def __init__(self, api_key):
+        self.client = openai.OpenAI(api_key=api_key)
+
+    def transcribe(self, audio, language="fr", beam_size=5):
+        # audio est un tableau numpy float32 mono
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            import wave
+            with wave.open(tmp.name, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2) # 16-bit
+                wf.setframerate(16000)
+                # Convert float32 [-1, 1] to int16
+                audio_int16 = (audio * 32767).astype(np.int16)
+                wf.writeframes(audio_int16.tobytes())
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, "rb") as audio_file:
+                transcript = self.client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language=language
+                )
+            # Retourne une liste de segments pour compatibilité avec faster-whisper
+            return [WhisperSegment(transcript.text)], None
+        except Exception as e:
+            print(f"  [API Whisper] erreur : {e}")
+            return [], None
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 def _ajouter_dll_nvidia():
-    """Rend les DLL cuBLAS et cuDNN visibles pour faster-whisper."""
-    racines = []
-    try:
-        import nvidia
-        racines = [Path(p) for p in getattr(nvidia, "__path__", [])]
-    except ImportError:
-        pass
-
-    if not racines:
-        import sysconfig
-        base = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
-        if base.exists():
-            racines = [base]
-
-    dossiers = []
-    for racine in racines:
-        dossiers.extend(racine.glob("*/bin"))
-        dossiers.extend(racine.glob("*/lib"))
-
-    for dossier in dossiers:
-        chemin = str(dossier)
-        if chemin not in os.environ["PATH"]:
-            os.environ["PATH"] = chemin + os.pathsep + os.environ["PATH"]
-        try:
-            os.add_dll_directory(chemin)
-        except (OSError, AttributeError):
-            pass
-
+    # Cette fonction est devenue inutile mais on la laisse pour ne pas casser les appels
+    pass
 
 def charger_whisper():
-    """Charge Whisper sur GPU si possible, sinon sur CPU."""
-    _ajouter_dll_nvidia()
+    """Utilise l'API OpenAI pour la transcription."""
+    cle = config.reglage("whisper.openai_api_key", "")
+    if not cle:
+        print("ATTENTION : aucune cle openai_api_key dans config.yaml. Whisper ne fonctionnera pas.")
+        # Retourne un objet factice pour éviter le crash au démarrage
+        class DummyWhisper:
+            def transcribe(self, *args, **kwargs): return [], None
+        return DummyWhisper()
 
-    try:
-        modele = WhisperModel(MODELE_WHISPER, device="cuda", compute_type="float16")
-        modele.transcribe(np.zeros(TAUX, dtype=np.float32), language="fr")
-        print(f"Whisper {MODELE_WHISPER} sur GPU.")
-        return modele
-    except Exception as e:
-        print(f"GPU indisponible ({type(e).__name__}), bascule sur CPU.")
-
-    for taille in (MODELE_WHISPER, "small"):
-        try:
-            modele = WhisperModel(taille, device="cpu", compute_type="int8")
-            print(f"Whisper {taille} sur CPU.")
-            return modele
-        except Exception:
-            continue
-
-    raise RuntimeError("Impossible de charger Whisper.")
+    print("Whisper configuré via API OpenAI.")
+    return OpenAIWhisper(cle)
 
 
 # ---------------------------------------------------------------- principal
@@ -1029,12 +1030,13 @@ def repondre_en_ecoutant(historique, flux, reveil, whisper):
             continue
 
         # voie 1 : le mot d'activation
-        scores = reveil.predict((bloc * 32767).astype(np.int16))
-        if max(scores.values()) >= SEUIL_INTERRUPTION:
-            couper_parole()
-            interrompu, relancer = True, True
-            print("  [micro] Je me tais.")
-            break
+        if reveil is not None:
+            scores = reveil.predict((bloc * 32767).astype(np.int16))
+            if max(scores.values()) >= SEUIL_INTERRUPTION:
+                couper_parole()
+                interrompu, relancer = True, True
+                print("  [micro] Je me tais.")
+                break
 
         # voie 2 : un ordre d'arret prononce par-dessus
         niv = niveau(bloc)
@@ -1244,9 +1246,15 @@ def main():
 
     reveil = None
     if not serveur_sans_peripheriques:
-        reveil = WakeModel(wakeword_model_paths=[str(
-            Path(openwakeword.__file__).parent / "resources" / "models" / "hey_jarvis_v0.1.onnx"
-        )])
+        try:
+            import openwakeword
+            from openwakeword.model import Model as WakeModel
+            reveil = WakeModel(wakeword_model_paths=[str(
+                Path(openwakeword.__file__).parent / "resources" / "models" / "hey_jarvis_v0.1.onnx"
+            )])
+        except Exception as e:
+            print(f"  [SÉCURITÉ] openWakeWord indisponible ({e}). Jarvis fonctionnera sans mot d'activation.")
+            reveil = None
 
     whisper = charger_whisper()
 
@@ -1452,27 +1460,36 @@ def main():
                 _hud("etat", "veille")
                 _hud("niveau", _niv_hud(bloc))
 
-                scores = reveil.predict((bloc * 32767).astype(np.int16))
-                score_reveil = max(scores.values())
-                if score_reveil < SEUIL_REVEIL:
-                    continue
-                reveil.reset()
-                from core.arbitrage_micro import reserver_reveil
-                priorite = float(config.reglage("assistant.priorite_micro", 1.0) or 1.0)
-                if not reserver_reveil("principal", score_reveil * priorite):
-                    print("  [micro] Wake ignoré : un micro plus proche a répondu.")
-                    continue
+                if reveil is not None:
+                    scores = reveil.predict((bloc * 32767).astype(np.int16))
+                    score_reveil = max(scores.values())
+                    if score_reveil < SEUIL_REVEIL:
+                        continue
+                    reveil.reset()
+                    from core.arbitrage_micro import reserver_reveil
+                    priorite = float(config.reglage("assistant.priorite_micro", 1.0) or 1.0)
+                    if not reserver_reveil("principal", score_reveil * priorite):
+                        print("  [micro] Wake ignoré : un micro plus proche a répondu.")
+                        continue
+                else:
+                    # Mode Direct : on passe l'étape du Wake Word
+                    pass
 
             enchainer = False
             _hud("etat", "ecoute")
             if not suite:
-                print("  [micro] Oui ?")
-                if config.reglage("hud.premier_plan_au_reveil", True):
-                    # Accuse visuel du mot d'activation : la fenetre du HUD passe
-                    # devant, en fond pour ne retarder ni le bip ni l'ecoute.
-                    threading.Thread(target=_hud, args=("mettre_au_premier_plan",),
-                                     daemon=True).start()
-                bip()
+                # Force l'écoute si le réveil est indisponible
+                if reveil is None:
+                    print("  [Mode Direct] Écoute active (Wake Word indisponible)...")
+                    _hud("etat", "ecoute")
+                else:
+                    print("  [micro] Oui ?")
+                    if config.reglage("hud.premier_plan_au_reveil", True):
+                        # Accuse visuel du mot d'activation : la fenetre du HUD passe
+                        # devant, en fond pour ne retarder ni le bip ni l'ecoute.
+                        threading.Thread(target=_hud, args=("mettre_au_premier_plan",),
+                                         daemon=True).start()
+                    bip()
 
             audio = capturer(flux, tampon)
             if audio is None:
@@ -1498,3 +1515,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
